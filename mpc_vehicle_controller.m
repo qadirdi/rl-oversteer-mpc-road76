@@ -1,0 +1,504 @@
+function mpc_vehicle_controller(block)
+% =========================================================================
+%  ADAPTIVE MPC VEHICLE PATH-TRACKING CONTROLLER  –  Level-2 S-Function
+%
+%  Adapts speed purely from observed vehicle dynamics (vy, r).
+%  NO mu input – grip is inferred the same way a real ESC/VSC system works:
+%  by comparing what the vehicle IS doing vs what it SHOULD be doing.
+%
+%  ── HOW GRIP IS INFERRED ─────────────────────────────────────────────────
+%
+%  1. SIDE-SLIP INDEX  (oversteer / rear grip loss)
+%     β = atan2(vy, vx)          ← actual body slip angle
+%     β_ref = 5° on dry road     ← reference for "grip used up"
+%     slip_usage = |β| / β_ref   ← 0 = no slip, 1 = at grip limit, >1 = sliding
+%
+%  2. YAW RATE DEFICIT INDEX  (understeer / front grip loss)
+%     r_kin  = v·tan(δ/SR)/L     ← yaw rate the bicycle model expects
+%     us_idx = (r_kin - r)/|r_kin|  when steering
+%     Positive → front not responding → understeer → front grip lost
+%
+%  3. COMBINED INSTABILITY INDEX
+%     instability = clamp(max(slip_usage, us_idx), 0, 1)
+%     0 = fully stable, 1 = at or beyond grip limit
+%
+%  4. SPEED TARGET
+%     v_demand = v_target × (1 − k_reduce × instability)
+%     When instability → 0: full 60 km/h  (no grip loss = full speed)
+%     When instability → 1: v_target × (1 − k_reduce) = ~22 km/h
+%     This is continuous – no hard switching, no thresholds to tune
+%
+%  5. ASYMMETRIC FILTER
+%     Drop fast (α=0.6, reaches target in ~0.25 s)
+%     Recover slow (α=0.03, ~1.6 s back to cruise)
+%     So: grip loss → quick brake, grip recovery → gradual re-accelerate
+%
+%  ── INPUTS ────────────────────────────────────────────────────────────────
+%   1  X      Global X      [m]    ← vehicle Out1
+%   2  Y      Global Y      [m]    ← vehicle Out2
+%   3  psi    Heading       [rad]  ← vehicle Out4
+%   4  speed  |v|           [m/s]  ← vehicle Out3
+%   5  vy     Lateral vel   [m/s]  ← vehicle Out8
+%   6  r      Yaw rate      [rad/s]← vehicle Out9
+%
+%  ── OUTPUTS ───────────────────────────────────────────────────────────────
+%   1  delta_sw   Steering wheel [rad]  → vehicle In1
+%   2  accel_cmd  Throttle       [0..1] → vehicle In2
+%   3  brake_cmd  Brake          [0..1] → vehicle In3
+%   4  cte        Cross-track error [m]    (monitor)
+%   5  he         Heading error    [rad]   (monitor)
+%   6  v_adapted  Adapted target   [m/s]   (monitor – shows grip inference)
+%
+%  ── TUNING ────────────────────────────────────────────────────────────────
+%   Everything in get_params() below. Leave dialog box EMPTY.
+% =========================================================================
+setup(block);
+end
+
+
+% =========================================================================
+function setup(block)
+    block.NumInputPorts  = 6;    % X, Y, psi, speed, vy, r  (NO mu)
+    block.NumOutputPorts = 6;
+    block.SetPreCompInpPortInfoToDynamic;
+    block.SetPreCompOutPortInfoToDynamic;
+
+    for k = 1:6
+        block.InputPort(k).Dimensions        = 1;
+        block.InputPort(k).DatatypeID        = 0;
+        block.InputPort(k).Complexity        = 'Real';
+        block.InputPort(k).DirectFeedthrough = true;
+    end
+    for k = 1:6
+        block.OutputPort(k).Dimensions = 1;
+        block.OutputPort(k).DatatypeID = 0;
+        block.OutputPort(k).Complexity = 'Real';
+    end
+
+    block.NumDialogPrms  = 0;
+    block.NumContStates  = 0;
+    block.SampleTimes    = [0.10 0];      % 10 Hz  (was 20 Hz, halves fmincon calls)
+    block.SimStateCompliance = 'DefaultSimState';
+
+    block.RegBlockMethod('PostPropagationSetup', @PostPropSetup);
+    block.RegBlockMethod('InitializeConditions', @InitConditions);
+    block.RegBlockMethod('Outputs',              @Outputs);
+    block.RegBlockMethod('Update',               @Update);
+    block.RegBlockMethod('Terminate',            @Terminate);
+end
+
+
+% =========================================================================
+%  DWORK
+%   1  prev_delta    [1]    previous steering wheel angle [rad]
+%   2  prev_thr      [1]    previous throttle [-1..+1]
+%   3  warm_delta    [Nc]   warm-start steering sequence
+%   4  warm_thr      [Nc]   warm-start throttle sequence
+%   5  closest_idx   [1]    search hint for closest path point
+%   6  v_adapted     [1]    smoothed speed target [m/s]
+% =========================================================================
+function PostPropSetup(block)
+    p  = get_params();
+    Nc = p.Nc;
+    block.NumDworks = 6;
+    names = {'prev_delta','prev_thr','warm_delta','warm_thr','closest_idx','v_adapted'};
+    dims  = [1, 1, Nc, Nc, 1, 1];
+    for k = 1:6
+        block.Dwork(k).Name            = names{k};
+        block.Dwork(k).Dimensions      = dims(k);
+        block.Dwork(k).DatatypeID      = 0;
+        block.Dwork(k).Complexity      = 'Real';
+        block.Dwork(k).UsedAsDiscState = true;
+    end
+end
+
+
+% =========================================================================
+function InitConditions(block)
+    p = get_params();
+    block.Dwork(1).Data = 0;
+    block.Dwork(2).Data = 0;
+    block.Dwork(3).Data = zeros(p.Nc, 1);
+    block.Dwork(4).Data = 0.45 * ones(p.Nc, 1);  % warm throttle for 60 km/h
+    block.Dwork(6).Data = p.v_target;             % start at cruise target
+
+    % DWork(5) = prev_idx waypoint search hint.
+    % Initialise to sim_start_wp so teleported episodes search the
+    % correct part of the road instead of defaulting to wp1.
+    % Without this, episodes starting at wp628 search [1..121] and
+    % compute CTE = 100s of metres → immediate crash → sim error.
+    start_wp = 1;
+    try
+        start_wp = max(1, round(evalin('base','sim_start_wp')));
+    catch
+    end
+    block.Dwork(5).Data = double(start_wp);
+end
+
+
+% =========================================================================
+function Outputs(block)
+    [X, Y, psi, spd, vy, r] = read_inputs(block);
+    p  = get_params();
+    rr = get_road_ref();
+
+    if isempty(rr)
+        set_outputs(block, 0, 0.45, 0, 0, 0, p.v_target);
+        return;
+    end
+
+    v_adapted = adapt_speed(spd, vy, r, block.Dwork(1).Data, block.Dwork(6).Data, p);
+
+    prev_idx = max(1, round(block.Dwork(5).Data));
+    [cte, he, ref_idx, ~] = compute_errors(X, Y, psi, spd, rr, prev_idx, p);
+
+    u_warm = [block.Dwork(3).Data; block.Dwork(4).Data];
+    u_opt  = run_mpc([X;Y;psi;spd], rr, ref_idx, ...
+                     u_warm, block.Dwork(1).Data, p, v_adapted);
+
+    delta_sw = u_opt(1);
+    thr      = u_opt(p.Nc + 1);
+    accel    = max(0,  thr);
+    brake    = min(1, max(0, -thr));
+
+    set_outputs(block, delta_sw, accel, brake, cte, he, v_adapted);
+end
+
+
+% =========================================================================
+function Update(block)
+    [X, Y, psi, spd, vy, r] = read_inputs(block);
+    p  = get_params();
+    rr = get_road_ref();
+    if isempty(rr); return; end
+
+    v_adapted = adapt_speed(spd, vy, r, block.Dwork(1).Data, block.Dwork(6).Data, p);
+
+    prev_idx = max(1, round(block.Dwork(5).Data));
+    [~, ~, ref_idx, ~] = compute_errors(X, Y, psi, spd, rr, prev_idx, p);
+
+    u_warm = [block.Dwork(3).Data; block.Dwork(4).Data];
+    u_opt  = run_mpc([X;Y;psi;spd], rr, ref_idx, ...
+                     u_warm, block.Dwork(1).Data, p, v_adapted);
+
+    Nc = p.Nc;
+    block.Dwork(1).Data = u_opt(1);
+    block.Dwork(2).Data = u_opt(Nc + 1);
+    block.Dwork(3).Data = [u_opt(2:Nc);      u_opt(Nc)];
+    block.Dwork(4).Data = [u_opt(Nc+2:2*Nc); u_opt(2*Nc)];
+    block.Dwork(5).Data = double(ref_idx);
+    block.Dwork(6).Data = v_adapted;
+end
+
+
+% =========================================================================
+function Terminate(~)
+end
+
+
+% =========================================================================
+%  INFERRED-GRIP ADAPTIVE SPEED
+%
+%  No mu knowledge needed.  Uses vy and r — quantities a real vehicle
+%  stability system measures — to infer how much grip is being used.
+%
+%  instability index  ∈ [0, 1]:
+%    0 = vehicle behaving exactly as kinematic model predicts → full grip
+%    1 = vehicle at or beyond grip limit → large slide or severe understeer
+%
+%  Speed target = v_target × (1 − k_reduce × instability)
+%  k_reduce = 0.63  →  at instability=1: 60×(1-0.63) = 22 km/h
+%
+%  The index is CONTINUOUS – small deviations cause small reductions.
+%  No thresholds to cross, no binary switching.
+% =========================================================================
+function v_adapted = adapt_speed(spd, vy, r, prev_delta_sw, v_prev, p)
+
+    vx = max(spd, 1.0);
+
+    % ── Oversteer index: how much of slip budget is used ─────────────────
+    beta       = atan2(vy, vx);                   % body slip angle [rad]
+    slip_usage = min(abs(beta) / p.beta_ref, 1.0);  % 0=none, 1=at/beyond limit
+
+    % ── Understeer index: yaw rate deficit while steering ─────────────────
+    delta_road  = prev_delta_sw / p.SR;
+    r_kinematic = spd * tan(delta_road) / p.L;    % expected yaw rate
+
+    % Only meaningful when actively steering with enough speed
+    if abs(delta_road) > 0.02 && abs(r_kinematic) > 0.05
+        % Positive when actual r is less than expected (understeer)
+        us_raw = (r_kinematic - r) / abs(r_kinematic);
+        us_idx = max(0, min(us_raw, 1.0));
+    else
+        us_idx = 0;
+    end
+
+    % ── Combined instability index (take the worse of the two) ────────────
+    instability = max(slip_usage, us_idx);
+
+    % ── Continuous speed demand ────────────────────────────────────────────
+    % k_reduce = 0.63: instability=1 → 60×(1-0.63) ≈ 22 km/h
+    % instability=0.5 → 60×(1-0.315) ≈ 41 km/h  (feels proportional)
+    v_demand = p.v_target * (1.0 - p.k_reduce * instability);
+    v_demand = max(v_demand, p.v_min);
+
+    % ── Asymmetric first-order filter ─────────────────────────────────────
+    % Drop fast when instability grows, recover slowly when it clears
+    if v_demand < v_prev
+        alpha = p.alpha_down;     % quick reduction  (~0.25 s to reach target)
+    else
+        alpha = p.alpha_up;       % slow recovery    (~1.6 s back to cruise)
+    end
+
+    v_adapted = alpha * v_demand + (1.0 - alpha) * v_prev;
+    v_adapted = max(v_adapted, p.v_min);
+end
+
+
+% =========================================================================
+%  MPC OPTIMIZER
+%  Allows active braking when v_adapted has dropped significantly
+%  (meaning inferred instability is high).
+% =========================================================================
+function u_opt = run_mpc(state0, rr, ref_idx, u_warm, prev_delta, p, v_adapted)
+    Nc = p.Nc;
+
+    % Enable braking when speed target has been significantly reduced
+    % This threshold (75%) means "some instability was detected"
+    if v_adapted < p.v_target * 0.75
+        thr_lo = -1.0;       % full brake allowed – MPC must decelerate
+    else
+        thr_lo = p.thr_min;  % stable – coast only
+    end
+
+    lb = [-2.0*ones(Nc,1);  thr_lo*ones(Nc,1)];
+    ub = [ 2.0*ones(Nc,1);        ones(Nc,1)];
+
+    cost = @(u) mpc_cost(u, state0, rr, ref_idx, prev_delta, p, v_adapted);
+
+    opts = optimoptions('fmincon', ...
+        'Algorithm',             'sqp', ...
+        'Display',               'off', ...
+        'MaxIterations',         25, ...         % was 60  → 2.4× faster
+        'MaxFunctionEvaluations', 800, ...       % was 2000
+        'FiniteDifferenceType',  'forward', ...  % was 'central' → 2× fewer evals
+        'OptimalityTolerance',   1e-3, ...       % slightly relaxed → exits sooner
+        'StepTolerance',         1e-4);
+    try
+        u_opt = fmincon(cost, u_warm, [],[],[],[], lb, ub, [], opts);
+    catch
+        u_opt = u_warm;
+    end
+end
+
+
+% =========================================================================
+%  MPC COST FUNCTION
+%
+%  Speed reference = v_adapted (flat, set by grip inference).
+%  No geometry-based speed reduction inside – curvature does NOT slow
+%  the vehicle unless the vehicle ACTUALLY starts sliding on that corner.
+%  w_v is raised when instability is detected so MPC commits to braking.
+% =========================================================================
+function J = mpc_cost(u, state0, rr, ref_idx0, prev_delta, p, v_adapted)
+    Np = p.Np;  Nc = p.Nc;  Ts = p.Ts;  N = size(rr, 1);
+
+    d_seq = [u(1:Nc);       repmat(u(Nc),    max(0,Np-Nc), 1)];
+    t_seq = [u(Nc+1:2*Nc);  repmat(u(2*Nc),  max(0,Np-Nc), 1)];
+
+    x = state0(1);  y = state0(2);
+    psi = state0(3);  v = state0(4);
+    J = 0;  pd = prev_delta;
+
+    % Raise speed weight when deceleration is needed
+    if v_adapted < p.v_target * 0.75
+        w_v_eff = 10.0;   % MPC actively brakes to reach v_adapted
+    else
+        w_v_eff = p.w_v;  % stable – soft speed tracking, don't over-brake
+    end
+
+    for k = 1:Np
+        ri  = min(ref_idx0 + k - 1, N);
+        xr  = rr(ri,1);  yr = rr(ri,2);  pr = rr(ri,3);
+
+        % Signed cross-track error
+        cte = -sin(pr)*(x - xr) + cos(pr)*(y - yr);
+
+        % Heading error
+        he  = mod(psi - pr + pi, 2*pi) - pi;
+
+        % Flat speed reference – v_adapted already encodes all adaptation
+        v_ref = max(v_adapted, p.v_min);
+
+        dk = d_seq(k);  tk = t_seq(k);
+
+        J = J  +  p.w_cte    * cte^2           ...
+               +  p.w_he     * he^2             ...
+               +  w_v_eff    * (v - v_ref)^2    ...
+               +  p.w_delta  * dk^2             ...
+               +  p.w_ddelta * (dk - pd)^2      ...
+               +  p.w_thr    * tk^2;
+        pd = dk;
+
+        a_k = tk*(tk >= 0)*p.a_max + tk*(tk < 0)*p.a_brk;
+        x   = x   + v*cos(psi)*Ts;
+        y   = y   + v*sin(psi)*Ts;
+        psi = mod(psi + (v/p.L)*tan(dk/p.SR)*Ts + pi, 2*pi) - pi;
+        v   = max(0, v + a_k*Ts);
+    end
+
+    % Terminal penalty (5×)
+    ri_t  = min(ref_idx0 + Np, N);
+    cte_t = -sin(rr(ri_t,3))*(x - rr(ri_t,1)) + cos(rr(ri_t,3))*(y - rr(ri_t,2));
+    he_t  = mod(psi - rr(ri_t,3) + pi, 2*pi) - pi;
+    J = J  +  5*p.w_cte*cte_t^2  +  5*p.w_he*he_t^2;
+end
+
+
+% =========================================================================
+%  COMPUTE ERRORS + CLOSEST POINT
+% =========================================================================
+function [cte, he, best_idx, v_ref] = compute_errors(X, Y, psi, spd, rr, prev_idx, p)
+    N   = size(rr, 1);
+    ilo = max(1,   prev_idx - 3);
+    ihi = min(N,   prev_idx + 120);
+
+    dx = rr(ilo:ihi,1) - X;
+    dy = rr(ilo:ihi,2) - Y;
+    [~, li] = min(dx.^2 + dy.^2);
+    best_idx = ilo + li - 1;
+
+    % Dynamic lookahead: 0.9 s or minimum 6 m
+    la_i = round(max(6.0, spd * 0.9) / p.path_ds);
+    ri   = min(best_idx + la_i, N);
+
+    xr = rr(ri,1);  yr = rr(ri,2);  pr = rr(ri,3);
+    cte = -sin(pr)*(X - xr) + cos(pr)*(Y - yr);
+    he  = mod(psi - pr + pi, 2*pi) - pi;
+    v_ref = p.v_target;
+end
+
+
+% =========================================================================
+%  PARAMETERS
+% =========================================================================
+function p = get_params()
+
+    % ── Horizon ───────────────────────────────────────────────────────────
+    p.Np = 15;           % prediction steps  (1.5 s lookahead at 10 Hz)
+    p.Nc = 5;            % control steps
+    p.Ts = 0.10;         % [s] must match block.SampleTimes above
+
+    % Fast mode: dry_run_diagnostics sets mpc_fast_mode=true to reduce
+    % fmincon calls and make the 10s test run in ~1 min instead of ~5 min
+    try
+        if evalin('base','mpc_fast_mode')
+            p.Np = 8;    % fast mode: very short horizon for testing
+            p.Nc = 3;
+        end
+    catch
+    end
+
+    % ── Cruise speed ──────────────────────────────────────────────────────
+    p.v_target = 60 / 3.6;   % [m/s] = 60 km/h normal speed
+    p.v_min    =  5.0;        % [m/s] = 18 km/h absolute floor in any condition
+
+    % ── Stable-mode throttle floor ────────────────────────────────────────
+    p.thr_min = 0.0;   % 0 = coast allowed, no braking in stable mode
+
+    % ── Path following weights (tighter than before for better tracking) ──
+    p.w_cte    = 14.0;  % cross-track error
+    p.w_he     =  8.0;  % heading error
+    p.w_ddelta =  5.0;  % steering smoothness (high → no oscillation)
+    p.w_v      =  1.5;  % speed tracking in stable mode (kept low)
+    p.w_delta  =  0.2;  % steering magnitude
+    p.w_thr    =  0.1;  % throttle effort
+
+    % ── Grip inference parameters ─────────────────────────────────────────
+
+    % beta_ref: side-slip angle that counts as "100% grip used" [rad]
+    %   Small → very sensitive (detects loss early but may trigger in sharp turns)
+    %   Large → only reacts to big slides
+    %   5° is a good balance for road driving:
+    %     dry road normal cornering: β ≈ 1-2° → instability ≈ 0.2-0.4 → mild reduction
+    %     wet road cornering: β ≈ 3-4° → instability ≈ 0.6-0.8 → significant reduction
+    %     sliding: β > 5° → instability = 1.0 → maximum reduction
+    p.beta_ref = deg2rad(5.0);  % [rad]
+
+    % us_thr removed – understeer index is now continuous (no threshold)
+
+    % k_reduce: fraction of v_target reduced at full instability (instability=1)
+    %   0.63 → v_min_at_full_instability = 60×(1-0.63) ≈ 22 km/h
+    %   Adjust upward for more aggressive reduction, downward for gentler
+    p.k_reduce = 0.63;
+
+    % ── Speed adaptation filter ───────────────────────────────────────────
+    % alpha_down: response speed when instability GROWS
+    %   0.60 → 63% of step reached in 1 update (50 ms), effectively fast
+    %   Lower → smoother but slower reaction
+    p.alpha_down = 0.60;
+
+    % alpha_up: response speed when instability CLEARS (recovery)
+    %   0.03 → time constant ≈ 1/(0.03×20Hz) = 1.6 s to recover
+    %   Lower → more patient, higher → quicker re-acceleration
+    p.alpha_up = 0.03;
+
+    % ── Vehicle geometry ──────────────────────────────────────────────────
+    p.L        = 2.70;   % [m]   wheelbase
+    p.SR       = 15.0;   % [-]   steering ratio
+    p.a_max    =  4.0;   % [m/s²] max acceleration in prediction model
+    p.a_brk    =  6.0;   % [m/s²] max braking in prediction model
+    p.path_ds  =  1.0;   % [m]   road_ref waypoint spacing (set by build_road_ref)
+
+    % ── RL PARAMETER OVERRIDE ─────────────────────────────────────────────
+    % When sector_switch activates the RL agent, rl_mpc_agent_sfun writes
+    % 'rl_param_override' to workspace with additive deltas for each weight.
+    % Applied here so the rest of the MPC logic sees the tuned parameters
+    % transparently – no structural changes to the MPC needed.
+   try; rl_enabled = evalin('base','rl_agent_enabled'); catch; rl_enabled = true; end
+     if ~rl_enabled; return; end   % <── skip override entirely for baseline
+
+     try
+         ov = evalin('base', 'rl_param_override');
+         if isstruct(ov) && isfield(ov,'active') && ov.active
+             p.w_cte    = max(4.0,  min(30.0, p.w_cte    + ov.dw_cte));
+             p.w_he     = max(2.0,  min(20.0, p.w_he     + ov.dw_he));
+             p.w_ddelta = max(1.0,  min(15.0, p.w_ddelta + ov.dw_ddelta));
+             p.v_target = max(5.0/3.6, min(70.0/3.6, p.v_target + ov.dv_target));
+         end
+     catch
+     end
+        % Override not available – use default params (no action needed)
+    end
+
+
+
+% =========================================================================
+%  HELPERS
+% =========================================================================
+function [X, Y, psi, spd, vy, r] = read_inputs(block)
+    X   = block.InputPort(1).Data;
+    Y   = block.InputPort(2).Data;
+    psi = block.InputPort(3).Data;
+    spd = max(0.5, block.InputPort(4).Data);
+    vy  = block.InputPort(5).Data;
+    r   = block.InputPort(6).Data;
+end
+
+function set_outputs(block, dsw, ac, br, cte, he, vad)
+    block.OutputPort(1).Data = dsw;
+    block.OutputPort(2).Data = ac;
+    block.OutputPort(3).Data = br;
+    block.OutputPort(4).Data = cte;
+    block.OutputPort(5).Data = he;
+    block.OutputPort(6).Data = vad;
+end
+
+function rr = get_road_ref()
+    try
+        rr = evalin('base', 'road_ref');
+        if size(rr,2) < 3;  rr = [];  end
+    catch
+        rr = [];
+    end
+end
